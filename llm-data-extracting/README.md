@@ -1,56 +1,114 @@
-# Invoice Extraction Reliability Benchmark
+# Invoice OCR extraction reliability benchmark
 
-This project evaluates reliability and consistency for OCR-to-JSON invoice extraction.
+Benchmark for **structured invoice extraction** from OCR text: field accuracy, line-item F1, JSON validity, **run-to-run consistency**, OCR stress variants, and simple pairwise comparisons. No labels are passed into extractors.
+
+## Requirements
+
+- **Python 3.9+** (stdlib only for the default offline path).
+- **OpenAI** (optional): set `OPENAI_API_KEY` when using `--use-production-gpt4o`.
 
 ## Dataset
 
-The `dataset/` directory is gitignored. Place CSVs under `dataset/batch_1/batch_1/` (same layout as before) or pass `--dataset-root` to `run_study.py`.
+The `dataset/` directory is **gitignored**. Obtain CSVs separately and place them under:
 
-- Input: `OCRed Text`
-- Target: `Json Data` canonicalized to:
-  - `invoice`: `client_name`, `client_address`, `seller_name`, `seller_address`, `invoice_number`, `invoice_date`, `due_date`
-  - `items[]`: `description`, `quantity`, `total_price`
+`dataset/batch_1/batch_1/`
 
-## What This Pipeline Produces
+Each CSV must have columns: `File Name`, `Json Data` (ground-truth JSON string), `OCRed Text`.
 
-- `results/benchmark_details.csv`: per-document, per-run metrics.
-- `results/benchmark_summary.json`: aggregate metrics by model/prompt.
-- `results/benchmark_summary.md`: leaderboard and consistency stats.
-- `results/eval_split.json`: reproducible evaluation set file IDs and seed.
-- `results/document_profiles.csv`: OCR-noise and complexity buckets.
-- `results/analysis_summary.json`: bucket distributions and dataset profile.
-- `results/stratified_performance.csv`: stratified performance by model/prompt/OCR variant/complexity.
-- `results/significance_tests.csv`: pairwise sign-test-style comparisons.
+Canonical schema after normalization:
 
-## Metrics
+- **invoice:** `client_name`, `client_address`, `seller_name`, `seller_address`, `invoice_number`, `invoice_date`, `due_date`
+- **items[]:** `description`, `quantity`, `total_price`
 
-- Field exact accuracy
-- Field fuzzy accuracy (string similarity)
-- Item-level F1 (exact item tuple match)
-- JSON schema validity rate
-- Core score = average of:
-  - invoice exact accuracy excluding `due_date`
-  - item F1
-  - JSON validity
-- Consistency via run-to-run standard deviation for each metric
-- 95% confidence interval for core score (run-level mean CI)
+`due_date` is excluded from the **core score** when labels are uniformly empty (non-informative).
 
-## Run
+## Quick start (offline, no API)
 
 ```bash
+cd llm-data-extracting
 python3 run_study.py --runs 5 --eval-fraction 0.25 --seed 42
 ```
 
-Optional:
+Uses `RegexBaselineExtractor` + `SimulatedLLMExtractor` only. OCR goes to the model path; ground truth is used **only** for scoring.
 
-```bash
-python3 run_study.py --runs 5 --eval-fraction 0.25 --seed 42 --no-stress-test
+## OpenAI GPT-4o (production extractor)
+
+1. Set the key in your shell (do not commit keys):
+
+   ```bash
+   export OPENAI_API_KEY="your_key_here"
+   ```
+
+2. Start with a small run to avoid rate limits (`429`):
+
+   ```bash
+   python3 run_study.py --use-production-gpt4o --runs 1 --eval-fraction 0.05 --max-docs 20 --seed 42
+   ```
+
+3. Scale up when stable:
+
+   ```bash
+   python3 run_study.py --use-production-gpt4o --runs 5 --eval-fraction 0.25 --seed 42
+   ```
+
+- **`--max-docs N`:** cap eval documents (`0` = all). Helps with quotas and 429s.
+- **`--fail-on-api-error`:** exit if the API keeps failing after retries (default is to score empty predictions and continue).
+- Enabling GPT mode **sends OCR text to OpenAI**; treat that as external data processing for privacy/compliance.
+
+## CLI reference
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dataset-root` | `dataset/batch_1/batch_1` | Directory containing `*.csv` files. |
+| `--output-root` | `results` | Where artifacts are written. |
+| `--runs` | `5` | Repeated runs per model × prompt × OCR variant. |
+| `--eval-fraction` | `0.25` | Fraction of records used for evaluation (after shuffle). |
+| `--seed` | `42` | Split + perturbation RNG seed. |
+| `--no-stress-test` | off | If set, only `clean` OCR (no `mild_perturb` / `heavy_perturb`). |
+| `--use-production-gpt4o` | off | Use OpenAI GPT-4o instead of the local simulator for the “LLM” slot. |
+| `--max-docs` | `0` | Max eval documents (`0` = no cap). |
+| `--fail-on-api-error` | off | Fail hard on persistent API errors. |
+
+## Outputs (`results/`)
+
+| File | Purpose |
+|------|---------|
+| `benchmark_details.csv` | Per document, run, model, prompt, OCR variant: metrics. |
+| `benchmark_summary.json` | Aggregated means/std and 95% CI on core score. |
+| `benchmark_summary.md` | Human-readable table. |
+| `eval_split.json` | `seed`, `eval_fraction`, list of eval `file_name`s (reproducibility). |
+| `document_profiles.csv` | Per-doc complexity and heuristic OCR-noise score. |
+| `analysis_summary.json` | Counts and bucket distributions. |
+| `stratified_performance.csv` | Mean core score by model / prompt / OCR variant / complexity. |
+| `significance_tests.csv` | Pairwise comparisons of run-level core scores (sign-test-style pseudo p-values). |
+
+`results/` is gitignored; regenerate with `run_study.py`.
+
+## Metrics
+
+- **Field exact / fuzzy** accuracy over canonical invoice fields.
+- **Item F1** multiset match on `(description, quantity, total_price)` tuples.
+- **JSON validity** strict schema check.
+- **Core score:** mean of (invoice exact excluding `due_date`, item F1, JSON validity).
+- **Consistency:** std across runs; **95% CI** on run-level mean core score.
+
+## Project layout
+
+```
+llm-data-extracting/
+  run_study.py              # CLI entrypoint
+  src/reliability/
+    schema.py               # Normalization + record type
+    data.py                 # CSV load + seeded split
+    metrics.py              # Scoring + aggregation
+    models.py               # Regex baseline, simulator, optional GPT-4o
+    benchmark.py            # Main loop + OCR stress + summaries
+    analysis.py             # Profiles + stratified tables
+  paper/draft.md            # Draft write-up (optional)
 ```
 
-## Hardening Notes
+## Design notes
 
-- No label leakage: extractors only receive OCR text, prompt variant, and run seed.
-- Reproducible split: deterministic shuffled split controlled by `--seed`.
-- OCR robustness stress: `clean`, `mild_perturb`, and `heavy_perturb` OCR variants.
-- Current included extractors are offline baselines/simulators. Add real API-backed LLM extractors for publishable model comparisons.
-
+- **No leakage:** `extract(ocr_text, prompt_variant, run_seed)` only; labels used in `evaluate_document` only.
+- **Reproducibility:** same `--seed` and `--eval-fraction` + saved `eval_split.json` align benchmark and analysis.
+- **Stress test:** synthetic OCR drops/swap noise on `mild_perturb` and `heavy_perturb` (unless `--no-stress-test`).
